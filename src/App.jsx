@@ -167,7 +167,7 @@ export default function App() {
       if (left <= 0) {
         clearInterval(timerRef.current);
         if (playerRoleRef.current === 'admin') {
-          if (!isRevealingRef.current) { isRevealingRef.current = true; triggerReveal(); }
+          triggerReveal();
         } else if (!submittedRef.current && playerName) {
           doSubmit(myAnswer || '(no answer)');
         }
@@ -271,28 +271,33 @@ export default function App() {
   const triggerReveal = async () => {
     if (isRevealingRef.current) return;
     isRevealingRef.current = true;
-    const snap = await get(ref(db, 'game'));
-    const data = snap.val();
-    const answers = data.currentAnswers || {};
-    const rohanEntry = Object.values(answers).find(a => a.role === 'rohan');
-    const playerAnswers = Object.values(answers).filter(a => a.role !== 'rohan');
-    const rohanRaw = rohanEntry?.answer || '';
-    const allTexts = Object.values(answers).map(a => a.answer);
-    const groups = await groupAnswers(allTexts);
-    const { herdAnswer } = findHerd(playerAnswers.map(a => a.answer), groups);
-    const rohanCanon = getCanonical(rohanRaw, groups);
-    const newScores = { ...data.scores };
-    const pointsThisRound = {};
-    Object.values(answers).forEach(entry => {
-      if (entry.role === 'rohan') return;
-      const canon = getCanonical(entry.answer, groups);
-      let pts = 0;
-      if (herdAnswer && canon === herdAnswer) pts += 2;
-      if (rohanCanon && canon === rohanCanon) pts += 5;
-      pointsThisRound[entry.playerId] = { pts, answer: entry.answer, canon };
-      newScores[entry.playerId] = (newScores[entry.playerId] || 0) + pts;
-    });
-    await update(ref(db, 'game'), { phase: 'reveal', groupedAnswers: groups, herdAnswer: herdAnswer || '', rohanAnswer: rohanRaw, rohanCanon, pointsThisRound, scores: newScores, disqualified: null });
+    try {
+      const snap = await get(ref(db, 'game'));
+      const data = snap.val();
+      const answers = data.currentAnswers || {};
+      const rohanEntry = Object.values(answers).find(a => a.role === 'rohan');
+      const playerAnswers = Object.values(answers).filter(a => a.role !== 'rohan' && a.role !== 'admin');
+      const rohanRaw = rohanEntry?.answer || '';
+      const allTexts = Object.values(answers).map(a => a.answer);
+      const groups = await groupAnswers(allTexts);
+      const { herdAnswer } = findHerd(playerAnswers.map(a => a.answer), groups);
+      const rohanCanon = getCanonical(rohanRaw, groups);
+      const newScores = { ...data.scores };
+      const pointsThisRound = {};
+      Object.values(answers).forEach(entry => {
+        if (entry.role === 'rohan' || entry.role === 'admin') return;
+        const canon = getCanonical(entry.answer, groups);
+        let pts = 0;
+        if (herdAnswer && canon === herdAnswer) pts += 2;
+        if (rohanCanon && canon === rohanCanon) pts += 5;
+        pointsThisRound[entry.playerId] = { pts, answer: entry.answer, canon };
+        newScores[entry.playerId] = (newScores[entry.playerId] || 0) + pts;
+      });
+      await update(ref(db, 'game'), { phase: 'reveal', groupedAnswers: groups, herdAnswer: herdAnswer || '', rohanAnswer: rohanRaw, rohanCanon, pointsThisRound, scores: newScores, disqualified: null });
+    } catch (err) {
+      console.error('triggerReveal failed:', err);
+      isRevealingRef.current = false; // reset so admin can retry
+    }
   };
 
   // RECOMPUTE POINTS when admin changes herd answer
@@ -396,7 +401,7 @@ export default function App() {
       myAnswer={myAnswer} setMyAnswer={setMyAnswer} submitted={submitted}
       onSubmit={() => doSubmit(myAnswer)} players={players}
       currentAnswers={gs.currentAnswers || {}} isAdmin={isAdmin}
-      onForceReveal={() => { if (!isRevealingRef.current) { isRevealingRef.current = true; triggerReveal(); } }}
+      onForceReveal={triggerReveal}
       onSkip={handleSkip}
       onEnd={endGame} playerRole={playerRole}
     />
