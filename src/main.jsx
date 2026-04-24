@@ -11,27 +11,114 @@ const ROLE_KEY = 'rohans-mentality-role';
 
 const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 const clean = (value = '') => value.trim().slice(0, 100);
-const normalize = (value = '') => value
-  .toLowerCase()
-  .trim()
-  .replace(/[^a-z0-9\s]/g, '')
-  .replace(/\b(the|a|an|and|or|to|of|his|her|with)\b/g, '')
-  .replace(/\s+/g, ' ')
-  .trim();
+
+const STOP_WORDS = new Set(['the', 'a', 'an', 'and', 'or', 'to', 'of', 'his', 'her', 'with', 'at', 'in', 'on', 'for']);
+const ANSWER_ALIASES = {
+  nyc: 'new york',
+  'new york city': 'new york',
+  sf: 'san francisco',
+  'san fran': 'san francisco',
+  'sanfrancisco': 'san francisco',
+  philly: 'philadelphia',
+  fb: 'meta',
+  facebook: 'meta',
+  insta: 'instagram',
+  ig: 'instagram',
+  apple: 'apple',
+  iphone: 'iphone',
+  iphones: 'iphone',
+  stocks: 'stock',
+  shares: 'stock',
+  equities: 'stock',
+  equity: 'stock',
+  investing: 'investment',
+  investments: 'investment',
+  investor: 'investment',
+  debate: 'argument',
+  arguing: 'argument',
+  arguments: 'argument',
+  crochet: 'crochet',
+  crocheting: 'crochet'
+};
+
+function singularize(word) {
+  if (word.length <= 3) return word;
+  if (word.endsWith('ies')) return `${word.slice(0, -3)}y`;
+  if (word.endsWith('es') && !word.endsWith('ses')) return word.slice(0, -2);
+  if (word.endsWith('s') && !word.endsWith('ss')) return word.slice(0, -1);
+  return word;
+}
+
+function normalize(value = '') {
+  const base = value
+    .toLowerCase()
+    .trim()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (ANSWER_ALIASES[base]) return ANSWER_ALIASES[base];
+  const words = base
+    .split(' ')
+    .filter(Boolean)
+    .filter(word => !STOP_WORDS.has(word))
+    .map(word => ANSWER_ALIASES[word] || singularize(word));
+  const phrase = words.join(' ').trim();
+  return ANSWER_ALIASES[phrase] || phrase;
+}
+
+function editDistance(a, b) {
+  if (a === b) return 0;
+  if (!a || !b) return Math.max(a.length, b.length);
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+  for (let j = 1; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+function areSimilarAnswers(a, b) {
+  const x = normalize(a);
+  const y = normalize(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (editDistance(x, y) <= 1) return true;
+  const xWords = new Set(x.split(' '));
+  const yWords = new Set(y.split(' '));
+  const overlap = [...xWords].filter(w => yWords.has(w)).length;
+  const smaller = Math.min(xWords.size, yWords.size);
+  return smaller > 0 && overlap / smaller >= 0.75;
+}
 
 function groupAnswers(players, answers, excludeRoles = []) {
-  const groups = {};
+  const groups = [];
   Object.entries(answers || {}).forEach(([playerId, answer]) => {
     const player = players?.[playerId];
     if (!player || excludeRoles.includes(player.role)) return;
     const display = clean(answer.answer || '(no answer)') || '(no answer)';
-    const key = normalize(display) || '__blank__';
-    if (!groups[key]) groups[key] = { key, display, count: 0, playerIds: [] };
-    groups[key].count += 1;
-    groups[key].playerIds.push(playerId);
-    if (display.length < groups[key].display.length || groups[key].display === '(no answer)') groups[key].display = display;
+    const normalized = normalize(display) || '__blank__';
+    let group = groups.find(g => areSimilarAnswers(g.display, display) || g.key === normalized);
+    if (!group) {
+      group = { key: normalized, display, count: 0, playerIds: [], variants: [] };
+      groups.push(group);
+    }
+    group.count += 1;
+    group.playerIds.push(playerId);
+    group.variants.push(display);
+    if (display !== '(no answer)' && (group.display === '(no answer)' || display.length < group.display.length)) group.display = display;
   });
-  return Object.values(groups).sort((a, b) => b.count - a.count || a.display.localeCompare(b.display));
+  return groups.sort((a, b) => b.count - a.count || a.display.localeCompare(b.display));
+}
+
+function findMatchingGroup(groups, answer) {
+  return groups.find(g => g.playerIds?.length && areSimilarAnswers(g.display, answer));
 }
 
 function getRound(game) {
@@ -137,26 +224,27 @@ function App() {
     if (!fresh || fresh.status !== 'answering') return;
     const freshRound = getRound(fresh);
     const freshGroups = groupAnswers(fresh.players, freshRound.answers, ['admin', 'rohan']);
-    const herdKey = freshGroups[0]?.key || '';
+    const herdGroup = freshGroups[0];
     const rohanPlayer = Object.entries(fresh.players || {}).find(([, p]) => p.role === 'rohan');
-    const rohanKey = rohanPlayer ? normalize(freshRound.answers?.[rohanPlayer[0]]?.answer || '') : '';
+    const rohanRawAnswer = rohanPlayer ? clean(freshRound.answers?.[rohanPlayer[0]]?.answer || '') : '';
     const scoreUpdates = {};
     const roundScores = {};
     Object.entries(fresh.players || {}).forEach(([id, p]) => {
       if (p.role !== 'player') return;
-      const key = normalize(freshRound.answers?.[id]?.answer || '');
+      const rawAnswer = freshRound.answers?.[id]?.answer || '';
       let delta = 0;
-      const messages = [];
-      if (key && key === herdKey) { delta += 2; messages.push('Rohan says you just alright.'); }
-      if (key && rohanKey && key === rohanKey) { delta += 5; messages.push('Rohan says you are exceptional.'); }
+      const matchedHerd = !!herdGroup && areSimilarAnswers(rawAnswer, herdGroup.display);
+      const matchedRohan = !!rohanRawAnswer && areSimilarAnswers(rawAnswer, rohanRawAnswer);
+      if (matchedHerd) delta += 2;
+      if (matchedRohan) delta += 5;
       scoreUpdates[`players/${id}/score`] = (p.score || 0) + delta;
-      roundScores[id] = { delta, messages };
+      roundScores[id] = { delta, matchedHerd, matchedRohan };
     });
     await update(ref(db, GAME_PATH), {
       status: 'reveal',
       [`rounds/${fresh.currentRound}/status`]: 'reveal',
-      [`rounds/${fresh.currentRound}/herdAnswer`]: freshGroups[0]?.display || '',
-      [`rounds/${fresh.currentRound}/rohanAnswer`]: rohanPlayer ? clean(freshRound.answers?.[rohanPlayer[0]]?.answer || '') : '',
+      [`rounds/${fresh.currentRound}/herdAnswer`]: herdGroup?.display || '',
+      [`rounds/${fresh.currentRound}/rohanAnswer`]: rohanRawAnswer,
       [`rounds/${fresh.currentRound}/scoreDeltas`]: roundScores,
       ...scoreUpdates
     });
@@ -276,14 +364,14 @@ function App() {
             {player.role === 'rohan' && row.player?.role === 'player' && !round.disqualified && <button className="tiny dangerBtn" onClick={() => disqualify(row.id)}>Disqualify -1</button>}
             {round.disqualified === row.id && <em>Disqualified by Rohan</em>}
           </div>)}</div>
-          <h3>Rohan verdicts</h3>
-          <div className="verdicts">{Object.entries(round.scoreDeltas || {}).map(([id, s]) => <p key={id}><b>{game.players[id]?.name}</b>: +{s.delta || 0}{s.dq ? ' -1 DQ' : ''} {(s.messages || []).join(' ') || 'Rohan says nothing. Awkward.'}</p>)}</div>
+          <h3>Round log</h3>
+          <div className="verdicts">{Object.entries(round.scoreDeltas || {}).map(([id, s]) => <p key={id}><b>{game.players[id]?.name}</b>: {s.delta > 0 ? `+${s.delta}` : '0'} points{s.matchedHerd ? ' · matched HERD' : ''}{s.matchedRohan ? ' · matched ROHAN' : ''}{s.dq ? ' · -1 disqualified' : ''}</p>)}</div>
           {player.role === 'admin' && <div className="actions"><button className="primary" onClick={nextRound}>Next Round</button><button onClick={endGame}>End Game Early</button></div>}
         </>}
 
         {game.status === 'ended' && <>
           <h1>Winner: {winners.filter(([, p]) => (p.score || 0) === topScore).map(([, p]) => p.name).join(' + ') || 'Nobody'}</h1>
-          <p className="instruction">Rohan has judged the herd. Some were exceptional. Some were just alright.</p>
+          <p className="instruction">Final scores are locked. Highest score wins.</p>
           {player.role === 'admin' && <button className="dangerBtn" onClick={resetGame}>Reset Game</button>}
         </>}
       </div>
