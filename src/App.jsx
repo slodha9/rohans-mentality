@@ -135,14 +135,18 @@ export default function App() {
     prevRound.current = currentRound;
   }, [gameState?.phase, gameState?.currentRound]);
 
-  // Timer
+  // Timer — admin doesn't submit answers, only triggers reveal
   useEffect(() => {
     clearInterval(timerRef.current);
     if (!gameState || gameState.phase !== 'answer' || !gameState.timerEnd) return;
     const tick = () => {
       const left = Math.max(0, Math.ceil((gameState.timerEnd - Date.now()) / 1000));
       setTimerLeft(left);
-      if (left <= 0) { clearInterval(timerRef.current); if (!submitted && playerName) doSubmit(myAnswer || '(no answer)'); }
+      if (left <= 0) {
+        clearInterval(timerRef.current);
+        if (playerRole === 'admin') { triggerReveal(); }
+        else if (!submitted && playerName) { doSubmit(myAnswer || '(no answer)'); }
+      }
     };
     tick();
     timerRef.current = setInterval(tick, 500);
@@ -163,11 +167,11 @@ export default function App() {
 
     const p = { id: playerId, name, role: roleInput, joinedAt: Date.now() };
     if (roleInput === 'admin' && !data) {
-      await set(ref(db, 'game'), { phase: 'setup', players: { [playerId]: p }, scores: { [playerId]: 0 }, timerSeconds: 60, questions: QUESTIONS, currentRound: 0 });
+      await set(ref(db, 'game'), { phase: 'setup', players: { [playerId]: p }, scores: {}, timerSeconds: 60, questions: QUESTIONS, currentRound: 0 });
       setScreen('setup');
     } else {
       await update(ref(db, `game/players/${playerId}`), p);
-      await update(ref(db, `game/scores`), { [playerId]: 0 });
+      if (roleInput !== 'admin') await update(ref(db, `game/scores`), { [playerId]: 0 });
       setScreen('lobby');
     }
     setPlayerName(name);
@@ -198,17 +202,12 @@ export default function App() {
     });
   };
 
-  // SUBMIT ANSWER
+  // SUBMIT ANSWER — admin never calls this
   const doSubmit = async (text) => {
-    if (submitted) return;
+    if (submitted || playerRole === 'admin') return;
     const answer = (text || '').trim().slice(0, 100) || '(no answer)';
     setSubmitted(true);
     await update(ref(db, `game/currentAnswers/${playerId}`), { playerId, playerName, role: playerRole, answer });
-    const snap = await get(ref(db, 'game'));
-    const data = snap.val();
-    const total = Object.keys(data.players || {}).length;
-    const answered = Object.keys(data.currentAnswers || {}).length + 1;
-    if (answered >= total && playerRole === 'admin') await triggerReveal();
   };
 
   // REVEAL
@@ -422,7 +421,7 @@ function AnswerScreen({ question, round, total, timerLeft, timerTotal, myAnswer,
       <div style={{ width: '100%', maxWidth: 580, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div style={S.label}>Round {round + 1} / {total}</div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <div style={S.label}>{Object.keys(currentAnswers).length}/{Object.keys(players).length} in</div>
+          <div style={S.label}>{Object.keys(currentAnswers).length}/{Object.values(players).filter(p=>p.role!=='admin').length} in</div>
           {isAdmin && <button style={S.btnGhost} onClick={onEnd}>END GAME</button>}
         </div>
       </div>
@@ -473,7 +472,7 @@ function AnswerScreen({ question, round, total, timerLeft, timerTotal, myAnswer,
 function RevealScreen({ question, round, total, players, answers, herdAnswer, rohanAnswer, rohanCanon, points, scores, disqualified, playerId, isAdmin, isRohan, hasDisqualified, onDisqualify, onNext, isLast, onEnd }) {
   const nonRohan = Object.values(answers).filter(a => a.role !== 'rohan').sort((a, b) => (points[b.playerId]?.pts || 0) - (points[a.playerId]?.pts || 0));
   const rohanEntry = Object.values(answers).find(a => a.role === 'rohan');
-  const leaderboard = Object.values(players).filter(p => p.role !== 'rohan').sort((a, b) => (scores[b.id] || 0) - (scores[a.id] || 0));
+  const leaderboard = Object.values(players).filter(p => p.role !== 'rohan' && p.role !== 'admin').sort((a, b) => (scores[b.id] || 0) - (scores[a.id] || 0));
 
   const msg = (pts) => {
     if (pts >= 7) return { text: "Rohan says you are LEGENDARY. 🔥", c: '#ffd700' };
@@ -562,7 +561,7 @@ function RevealScreen({ question, round, total, players, answers, herdAnswer, ro
 
 // ─── END SCREEN ───────────────────────────────────────────────────────────────
 function EndScreen({ players, scores, isAdmin, onReset, playerName }) {
-  const board = Object.values(players).filter(p => p.role !== 'rohan').sort((a, b) => (scores[b.id] || 0) - (scores[a.id] || 0));
+  const board = Object.values(players).filter(p => p.role !== 'rohan' && p.role !== 'admin').sort((a, b) => (scores[b.id] || 0) - (scores[a.id] || 0));
   const winner = board[0];
   const verdicts = ["Rohan says: you might actually understand him. Scary. 🔥", "Rohan says: not bad. Not great either.", "Rohan says: you exist. That's something.", "Rohan says: who even are you? 👀"];
   return (
