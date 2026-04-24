@@ -127,7 +127,6 @@ export default function App() {
   const [timerSetup, setTimerSetup] = useState(60);
   const timerRef = useRef(null);
   const prevRound = useRef(null);
-  const isRevealingRef = useRef(false); // prevents double-trigger
 
   // Live sync
   useEffect(() => {
@@ -142,7 +141,7 @@ export default function App() {
     if (phase === 'setup') { if (playerRole === 'admin') setScreen('setup'); }
     else if (phase === 'lobby') setScreen('lobby');
     else if (phase === 'answer') {
-      if (currentRound !== prevRound.current) { setMyAnswer(''); setSubmitted(false); setHasDisqualified(false); isRevealingRef.current = false; }
+      if (currentRound !== prevRound.current) { setMyAnswer(''); setSubmitted(false); setHasDisqualified(false); }
       setScreen('answer');
     }
     else if (phase === 'reveal') setScreen('reveal');
@@ -150,13 +149,7 @@ export default function App() {
     prevRound.current = currentRound;
   }, [gameState?.phase, gameState?.currentRound]);
 
-  // Keep a ref to playerRole so timer callback always sees current value
-  const playerRoleRef = useRef(playerRole);
-  useEffect(() => { playerRoleRef.current = playerRole; }, [playerRole]);
-  const submittedRef = useRef(submitted);
-  useEffect(() => { submittedRef.current = submitted; }, [submitted]);
-
-  // Timer — admin doesn't submit answers, only triggers reveal
+  // Timer — just counts down. Admin side writes endRound flag when time is up.
   useEffect(() => {
     clearInterval(timerRef.current);
     if (!gameState || gameState.phase !== 'answer' || !gameState.timerEnd) return;
@@ -166,10 +159,13 @@ export default function App() {
       setTimerLeft(left);
       if (left <= 0) {
         clearInterval(timerRef.current);
-        if (playerRoleRef.current === 'admin') {
-          triggerReveal();
-        } else if (!submittedRef.current && playerName) {
+        // Non-admin players auto-submit their answer
+        if (playerRole !== 'admin' && !submitted && playerName) {
           doSubmit(myAnswer || '(no answer)');
+        }
+        // Admin signals round end via Firebase flag
+        if (playerRole === 'admin') {
+          update(ref(db, 'game'), { endRound: Date.now() });
         }
       }
     };
@@ -177,6 +173,12 @@ export default function App() {
     timerRef.current = setInterval(tick, 500);
     return () => clearInterval(timerRef.current);
   }, [gameState?.timerEnd, gameState?.phase]);
+
+  // Watch for endRound flag — ONLY admin client runs the actual reveal logic
+  useEffect(() => {
+    if (!gameState?.endRound || gameState?.phase !== 'answer' || playerRole !== 'admin') return;
+    runReveal();
+  }, [gameState?.endRound]);
 
   const endGame = () => { if (confirm('End game now?')) update(ref(db, 'game'), { phase: 'end' }); };
 
@@ -255,7 +257,7 @@ export default function App() {
     await update(ref(db, 'game'), {
       phase: 'answer', currentRound: idx, timerEnd: Date.now() + secs * 1000,
       currentAnswers: null, disqualified: null, groupedAnswers: null,
-      herdAnswer: null, rohanAnswer: null, pointsThisRound: null,
+      herdAnswer: null, rohanAnswer: null, pointsThisRound: null, endRound: null,
     });
   };
 
@@ -267,37 +269,32 @@ export default function App() {
     await update(ref(db, `game/currentAnswers/${playerId}`), { playerId, playerName, role: playerRole, answer });
   };
 
-  // REVEAL — guarded so it can only fire once per round
-  const triggerReveal = async () => {
-    if (isRevealingRef.current) return;
-    isRevealingRef.current = true;
-    try {
-      const snap = await get(ref(db, 'game'));
-      const data = snap.val();
-      const answers = data.currentAnswers || {};
-      const rohanEntry = Object.values(answers).find(a => a.role === 'rohan');
-      const playerAnswers = Object.values(answers).filter(a => a.role !== 'rohan' && a.role !== 'admin');
-      const rohanRaw = rohanEntry?.answer || '';
-      const allTexts = Object.values(answers).map(a => a.answer);
-      const groups = await groupAnswers(allTexts);
-      const { herdAnswer } = findHerd(playerAnswers.map(a => a.answer), groups);
-      const rohanCanon = getCanonical(rohanRaw, groups);
-      const newScores = { ...data.scores };
-      const pointsThisRound = {};
-      Object.values(answers).forEach(entry => {
-        if (entry.role === 'rohan' || entry.role === 'admin') return;
-        const canon = getCanonical(entry.answer, groups);
-        let pts = 0;
-        if (herdAnswer && canon === herdAnswer) pts += 2;
-        if (rohanCanon && canon === rohanCanon) pts += 5;
-        pointsThisRound[entry.playerId] = { pts, answer: entry.answer, canon };
-        newScores[entry.playerId] = (newScores[entry.playerId] || 0) + pts;
-      });
-      await update(ref(db, 'game'), { phase: 'reveal', groupedAnswers: groups, herdAnswer: herdAnswer || '', rohanAnswer: rohanRaw, rohanCanon, pointsThisRound, scores: newScores, disqualified: null });
-    } catch (err) {
-      console.error('triggerReveal failed:', err);
-      isRevealingRef.current = false; // reset so admin can retry
-    }
+  // Run the reveal — called only by admin when endRound flag is set
+  const runReveal = async () => {
+    const snap = await get(ref(db, 'game'));
+    const data = snap.val();
+    // Safety: don't run if already revealed
+    if (data.phase !== 'answer') return;
+    const answers = data.currentAnswers || {};
+    const rohanEntry = Object.values(answers).find(a => a.role === 'rohan');
+    const playerAnswers = Object.values(answers).filter(a => a.role !== 'rohan' && a.role !== 'admin');
+    const rohanRaw = rohanEntry?.answer || '';
+    const allTexts = Object.values(answers).map(a => a.answer);
+    const groups = await groupAnswers(allTexts);
+    const { herdAnswer } = findHerd(playerAnswers.map(a => a.answer), groups);
+    const rohanCanon = getCanonical(rohanRaw, groups);
+    const newScores = { ...data.scores };
+    const pointsThisRound = {};
+    Object.values(answers).forEach(entry => {
+      if (entry.role === 'rohan' || entry.role === 'admin') return;
+      const canon = getCanonical(entry.answer, groups);
+      let pts = 0;
+      if (herdAnswer && canon === herdAnswer) pts += 2;
+      if (rohanCanon && canon === rohanCanon) pts += 5;
+      pointsThisRound[entry.playerId] = { pts, answer: entry.answer, canon };
+      newScores[entry.playerId] = (newScores[entry.playerId] || 0) + pts;
+    });
+    await update(ref(db, 'game'), { phase: 'reveal', endRound: null, groupedAnswers: groups, herdAnswer: herdAnswer || '', rohanAnswer: rohanRaw, rohanCanon, pointsThisRound, scores: newScores, disqualified: null });
   };
 
   // RECOMPUTE POINTS when admin changes herd answer
@@ -366,12 +363,11 @@ export default function App() {
   // SKIP QUESTION — admin only, jumps to next round without reveal
   const handleSkip = async () => {
     if (!confirm('Skip this question? No points awarded for this round.')) return;
-    isRevealingRef.current = true; // prevent timer from triggering reveal
     clearInterval(timerRef.current);
     const snap = await get(ref(db, 'game'));
     const data = snap.val();
     const next = (data.currentRound || 0) + 1;
-    if (next >= QUESTIONS.length) await update(ref(db, 'game'), { phase: 'end' });
+    if (next >= QUESTIONS.length) await update(ref(db, 'game'), { phase: 'end', endRound: null });
     else await startRound(next, data.timerSeconds);
   };
 
@@ -401,7 +397,7 @@ export default function App() {
       myAnswer={myAnswer} setMyAnswer={setMyAnswer} submitted={submitted}
       onSubmit={() => doSubmit(myAnswer)} players={players}
       currentAnswers={gs.currentAnswers || {}} isAdmin={isAdmin}
-      onForceReveal={triggerReveal}
+      onForceReveal={() => update(ref(db, 'game'), { endRound: Date.now() })}
       onSkip={handleSkip}
       onEnd={endGame} playerRole={playerRole}
     />
@@ -595,7 +591,7 @@ function AnswerScreen({ question, round, total, timerLeft, timerTotal, myAnswer,
       </div>
       {isAdmin && (
         <div style={{ display: 'flex', gap: 8 }}>
-          <button style={{ ...S.btnGhost, color: '#22d3ee', borderColor: 'rgba(34,211,238,0.35)' }} onClick={onForceReveal}>FORCE REVEAL →</button>
+          <button style={{ ...S.btnGhost, color: '#22d3ee', borderColor: 'rgba(34,211,238,0.35)' }} onClick={onForceReveal}>⏹ END ROUND</button>
           <button style={{ ...S.btnGhost, color: '#ffaa00', borderColor: 'rgba(255,170,0,0.35)' }} onClick={onSkip}>SKIP QUESTION ⏭</button>
         </div>
       )}
