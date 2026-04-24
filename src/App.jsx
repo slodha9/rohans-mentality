@@ -38,11 +38,20 @@ async function groupAnswers(answers) {
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1000,
-        messages: [{ role: 'user', content: `Group these party game answers by semantic similarity. "pizza", "nyc pizza", "pepperoni pizza" → same group. "cricket" and "playing cricket" → same group. Be lenient.
+        messages: [{ role: 'user', content: `You are grouping answers for a party game about a person named Rohan. Group answers by semantic similarity. Be VERY lenient — when in doubt, group together.
 
-Answers: ${JSON.stringify(unique)}
+Rules:
+- Synonyms group together: "rat", "mouse", "mice", "rodent" → same group
+- Slash-separated aliases are ALL equivalent: if someone wrote "facebook/meta/fc", then "facebook", "meta", "fc", "fb", and any combo count as the same answer
+- Abbreviations, nicknames, alternate names all match: "fb" = "facebook" = "meta"  
+- Partial matches: "nyc pizza", "pepperoni pizza", "a pizza" → "pizza"
+- Activity + noun: "playing cricket", "cricket" → "cricket"
+- Same concept different words: "arguing", "debate", "fighting" → group together
+- Brand names and their common aliases: "apple", "iphone company", "cupertino" → "apple"
 
-Respond ONLY with a JSON object mapping each answer (lowercase) to its canonical group name (shortest/most common). No explanation, no markdown.` }]
+Answers to group: ${JSON.stringify(unique)}
+
+Respond ONLY with a valid JSON object mapping each answer (lowercase, exactly as given) to its canonical group name. Pick the most recognisable/shortest form as the canonical. No markdown, no explanation.` }]
       })
     });
     const data = await res.json();
@@ -80,6 +89,9 @@ function findHerd(playerAnswers, groups) {
   for (const [ans, n] of Object.entries(counts)) {
     if (n > max) { max = n; herd = ans; }
   }
+  // Require a clear majority: at least 2 people and no tie at the top
+  const tied = Object.values(counts).filter(n => n === max).length;
+  if (max < 2 || tied > 1) return { herdAnswer: null, counts };
   return { herdAnswer: herd, counts };
 }
 
@@ -256,6 +268,51 @@ export default function App() {
     await update(ref(db, 'game'), { phase: 'reveal', groupedAnswers: groups, herdAnswer: herdAnswer || '', rohanAnswer: rohanRaw, rohanCanon, pointsThisRound, scores: newScores, disqualified: null });
   };
 
+  // RECOMPUTE POINTS when admin changes herd answer
+  const recomputePoints = async (newHerdAnswer) => {
+    const snap = await get(ref(db, 'game'));
+    const data = snap.val();
+    const answers = data.currentAnswers || {};
+    const groups = data.groupedAnswers || {};
+    const rohanCanon = data.rohanCanon || '';
+    // Rebuild scores from scratch for this round
+    const baseScores = { ...data.scores };
+    const oldPoints = data.pointsThisRound || {};
+    // Subtract old round points first
+    Object.entries(oldPoints).forEach(([pid, { pts }]) => {
+      baseScores[pid] = (baseScores[pid] || 0) - pts;
+    });
+    // Also undo disqualification if any
+    if (data.disqualified) {
+      baseScores[data.disqualified] = (baseScores[data.disqualified] || 0) + 1;
+    }
+    const newPoints = {};
+    const newScores = { ...baseScores };
+    Object.values(answers).forEach(entry => {
+      if (entry.role === 'rohan' || entry.role === 'admin') return;
+      const canon = getCanonical(entry.answer, groups);
+      let pts = 0;
+      if (newHerdAnswer && canon === newHerdAnswer) pts += 2;
+      if (rohanCanon && canon === rohanCanon) pts += 5;
+      newPoints[entry.playerId] = { pts, answer: entry.answer, canon };
+      newScores[entry.playerId] = (newScores[entry.playerId] || 0) + pts;
+    });
+    // Re-apply disqualification
+    if (data.disqualified) {
+      newScores[data.disqualified] = (newScores[data.disqualified] || 0) - 1;
+    }
+    await update(ref(db, 'game'), { herdAnswer: newHerdAnswer || '', pointsThisRound: newPoints, scores: newScores });
+  };
+
+  // ADJUST individual player score
+  const adjustScore = async (targetPlayerId, delta) => {
+    const snap = await get(ref(db, 'game'));
+    const data = snap.val();
+    const newScores = { ...data.scores };
+    newScores[targetPlayerId] = (newScores[targetPlayerId] || 0) + delta;
+    await update(ref(db, 'game'), { scores: newScores });
+  };
+
   // DISQUALIFY
   const handleDisqualify = async (targetId) => {
     if (hasDisqualified || gameState.disqualified) return;
@@ -309,10 +366,12 @@ export default function App() {
       question={q} round={gs.currentRound} total={QUESTIONS.length}
       players={players} answers={gs.currentAnswers || {}}
       herdAnswer={gs.herdAnswer} rohanAnswer={gs.rohanAnswer} rohanCanon={gs.rohanCanon}
+      groupedAnswers={gs.groupedAnswers || {}}
       points={gs.pointsThisRound || {}} scores={scores}
       disqualified={gs.disqualified} playerId={playerId}
       isAdmin={isAdmin} isRohan={isRohan}
       hasDisqualified={hasDisqualified} onDisqualify={handleDisqualify}
+      onRecomputePoints={recomputePoints} onAdjustScore={adjustScore}
       onNext={handleNext} isLast={(gs.currentRound || 0) + 1 >= QUESTIONS.length}
       onEnd={endGame}
     />
@@ -494,10 +553,13 @@ function AnswerScreen({ question, round, total, timerLeft, timerTotal, myAnswer,
 }
 
 // ─── REVEAL SCREEN ────────────────────────────────────────────────────────────
-function RevealScreen({ question, round, total, players, answers, herdAnswer, rohanAnswer, rohanCanon, points, scores, disqualified, playerId, isAdmin, isRohan, hasDisqualified, onDisqualify, onNext, isLast, onEnd }) {
-  const nonRohan = Object.values(answers).filter(a => a.role !== 'rohan').sort((a, b) => (points[b.playerId]?.pts || 0) - (points[a.playerId]?.pts || 0));
+function RevealScreen({ question, round, total, players, answers, herdAnswer, rohanAnswer, rohanCanon, groupedAnswers, points, scores, disqualified, playerId, isAdmin, isRohan, hasDisqualified, onDisqualify, onRecomputePoints, onAdjustScore, onNext, isLast, onEnd }) {
+  const nonRohan = Object.values(answers).filter(a => a.role !== 'rohan' && a.role !== 'admin').sort((a, b) => (points[b.playerId]?.pts || 0) - (points[a.playerId]?.pts || 0));
   const rohanEntry = Object.values(answers).find(a => a.role === 'rohan');
   const leaderboard = Object.values(players).filter(p => p.role !== 'rohan' && p.role !== 'admin').sort((a, b) => (scores[b.id] || 0) - (scores[a.id] || 0));
+
+  // All canonical groups available to pick as herd answer
+  const canonicalOptions = Object.keys(groupedAnswers || {});
 
   const msg = (pts) => {
     if (pts >= 7) return { text: "Rohan says you are LEGENDARY. 🔥", c: '#ffd700' };
@@ -517,21 +579,46 @@ function RevealScreen({ question, round, total, players, answers, herdAnswer, ro
         <div style={{ ...S.label, color: '#ff3c3c', marginBottom: 6 }}>The Question</div>
         <div style={{ fontWeight: 700, fontSize: 'clamp(1rem,2.5vw,1.2rem)' }}>{question}</div>
       </div>
+
+      {/* Herd + Rohan answer cards */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, width: '100%', maxWidth: 640 }}>
-        {[
-          { label: "HERD'S ANSWER", sub: '+2 pts to matches', answer: herdAnswer || '—', c: '#22d3ee', icon: '🐟' },
-          { label: "ROHAN'S ANSWER", sub: '+5 pts to matches', answer: rohanEntry?.answer || rohanAnswer || '—', c: '#a855f7', icon: '👑' },
-        ].map(card => (
-          <div key={card.label} style={{ background: `${card.c}0d`, border: `1px solid ${card.c}40`, borderRadius: 12, padding: '1.1rem' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-              <span style={{ fontSize: 14 }}>{card.icon}</span>
-              <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.58rem', color: card.c, letterSpacing: '0.15em', textTransform: 'uppercase' }}>{card.label}</div>
-            </div>
-            <div style={{ fontWeight: 800, fontSize: 'clamp(1rem,2.5vw,1.25rem)', wordBreak: 'break-word' }}>{card.answer}</div>
-            <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.58rem', color: `${card.c}88`, marginTop: 4 }}>{card.sub}</div>
+        {/* Herd card — admin gets a dropdown to override */}
+        <div style={{ background: 'rgba(34,211,238,0.08)', border: '1px solid rgba(34,211,238,0.3)', borderRadius: 12, padding: '1.1rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+            <span style={{ fontSize: 14 }}>🐟</span>
+            <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.58rem', color: '#22d3ee', letterSpacing: '0.15em', textTransform: 'uppercase' }}>Herd's Answer</div>
           </div>
-        ))}
+          {isAdmin && canonicalOptions.length > 0 ? (
+            <select
+              value={herdAnswer || ''}
+              onChange={e => onRecomputePoints(e.target.value || null)}
+              style={{ background: '#111114', border: '1px solid rgba(34,211,238,0.4)', borderRadius: 6, color: '#f0f0f5', fontFamily: '"Syne",sans-serif', fontWeight: 800, fontSize: '0.95rem', padding: '4px 6px', width: '100%', cursor: 'pointer', marginBottom: 4 }}
+            >
+              <option value="">Y'all UNIQUE af (no herd)</option>
+              {canonicalOptions.map(opt => (
+                <option key={opt} value={opt}>{opt}</option>
+              ))}
+            </select>
+          ) : (
+            <div style={{ fontWeight: 800, fontSize: 'clamp(1rem,2.5vw,1.25rem)', wordBreak: 'break-word' }}>{herdAnswer || "Y'all UNIQUE af"}</div>
+          )}
+          <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.58rem', color: 'rgba(34,211,238,0.6)', marginTop: 4 }}>
+            {herdAnswer ? '+2 pts to matches' : 'no herd points this round'}
+            {isAdmin && <span style={{ color: 'rgba(34,211,238,0.4)', marginLeft: 6 }}>← admin can override</span>}
+          </div>
+        </div>
+        {/* Rohan card */}
+        <div style={{ background: 'rgba(168,85,247,0.08)', border: '1px solid rgba(168,85,247,0.3)', borderRadius: 12, padding: '1.1rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+            <span style={{ fontSize: 14 }}>👑</span>
+            <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.58rem', color: '#a855f7', letterSpacing: '0.15em', textTransform: 'uppercase' }}>Rohan's Answer</div>
+          </div>
+          <div style={{ fontWeight: 800, fontSize: 'clamp(1rem,2.5vw,1.25rem)', wordBreak: 'break-word' }}>{rohanEntry?.answer || rohanAnswer || '—'}</div>
+          <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.58rem', color: 'rgba(168,85,247,0.6)', marginTop: 4 }}>+5 pts to matches</div>
+        </div>
       </div>
+
+      {/* All answers */}
       <div style={{ width: '100%', maxWidth: 640 }}>
         <div style={{ ...S.label, marginBottom: 8 }}>All Answers</div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -563,18 +650,32 @@ function RevealScreen({ question, round, total, players, answers, herdAnswer, ro
           })}
         </div>
       </div>
+
+      {/* Standings — admin gets ± controls */}
       <div style={{ ...S.card, maxWidth: 640 }}>
-        <div style={{ ...S.label, marginBottom: 10 }}>Standings</div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <div style={S.label}>Standings</div>
+          {isAdmin && <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.6rem', color: '#5a5a72' }}>⚡ admin: adjust totals</div>}
+        </div>
         {leaderboard.map((p, i) => (
           <div key={p.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 10px', background: i === 0 ? 'rgba(255,215,0,0.05)' : 'transparent', border: `1px solid ${i === 0 ? 'rgba(255,215,0,0.15)' : 'transparent'}`, borderRadius: 8, marginBottom: 4 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <div style={{ fontFamily: '"Bebas Neue",sans-serif', fontSize: '1rem', color: i === 0 ? '#ffd700' : i === 1 ? '#9090a8' : '#5a5a72', width: 20, textAlign: 'center' }}>{i + 1}</div>
-              <div style={{ fontWeight: 600, fontSize: '0.9rem', color: p.id === playerId ? '#ff3c3c' : '#f0f0f5' }}>{p.name} {p.id === playerId && '(you)'}</div>
+              <div style={{ fontWeight: 600, fontSize: '0.9rem', color: p.id === playerId ? '#ff3c3c' : '#f0f0f5' }}>{p.name}</div>
             </div>
-            <div style={{ fontFamily: '"Bebas Neue",sans-serif', fontSize: '1.3rem', color: i === 0 ? '#ffd700' : '#f0f0f5' }}>{scores[p.id] || 0}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              {isAdmin && (
+                <button onClick={() => onAdjustScore(p.id, -1)} style={{ width: 26, height: 26, borderRadius: 6, border: '1px solid #2e2e38', background: 'transparent', color: '#9090a8', cursor: 'pointer', fontFamily: '"Bebas Neue",sans-serif', fontSize: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>−</button>
+              )}
+              <div style={{ fontFamily: '"Bebas Neue",sans-serif', fontSize: '1.3rem', color: i === 0 ? '#ffd700' : '#f0f0f5', minWidth: 28, textAlign: 'center' }}>{scores[p.id] || 0}</div>
+              {isAdmin && (
+                <button onClick={() => onAdjustScore(p.id, +1)} style={{ width: 26, height: 26, borderRadius: 6, border: '1px solid #2e2e38', background: 'transparent', color: '#9090a8', cursor: 'pointer', fontFamily: '"Bebas Neue",sans-serif', fontSize: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>+</button>
+              )}
+            </div>
           </div>
         ))}
       </div>
+
       {isRohan && <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.72rem', color: disqualified ? '#a855f7' : '#5a5a72', padding: '8px 14px', background: 'rgba(168,85,247,0.07)', border: '1px solid rgba(168,85,247,0.2)', borderRadius: 8 }}>{disqualified || hasDisqualified ? '👑 Disqualification applied.' : '👆 Tap DISQ −1 to penalise one player this round.'}</div>}
       {isAdmin
         ? <button style={{ ...S.btnPrimary, maxWidth: 640, marginBottom: '1rem' }} onClick={onNext}>{isLast ? 'SEE FINAL SCORES →' : 'NEXT ROUND →'}</button>
