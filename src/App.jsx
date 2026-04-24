@@ -26,56 +26,115 @@ const QUESTIONS = [
   "Rohan's at a bar and gets into a heated argument with a stranger. What is the argument about?",
 ];
 
-// ─── ANSWER GROUPING (AI) ────────────────────────────────────────────────────
+// ─── ANSWER GROUPING ─────────────────────────────────────────────────────────
+
+// Strip noise words to get the core noun(s) from an answer
+function coreOf(str) {
+  const noise = /\b(a|an|the|some|just|like|maybe|probably|his|my|its|some|bit of|piece of|slice of|type of|kind of|lot of|glass of|cup of|bottle of|game of|round of|bit|some|old|new|quick|good|bad|big|small|great|little)\b/gi;
+  return str.replace(noise, '').replace(/\s+/g, ' ').trim();
+}
+
+// Pre-group answers deterministically before sending to AI
+// Returns a mapping: answer → canonical, built from pure string logic
+function preGroup(unique) {
+  const mapping = {};
+  // Sort shortest first so shorter answers become canonicals
+  const sorted = [...unique].sort((a, b) => a.length - b.length);
+
+  sorted.forEach(a => { mapping[a] = a; }); // default: self
+
+  // For each pair, check if core of one contains core of the other
+  for (let i = 0; i < sorted.length; i++) {
+    const coreA = coreOf(sorted[i]);
+    for (let j = i + 1; j < sorted.length; j++) {
+      const coreB = coreOf(sorted[j]);
+      // If either core is contained in the other, group them under the shorter one
+      if (coreA && coreB && (coreB.includes(coreA) || coreA.includes(coreB))) {
+        // Map the longer one to the canonical of the shorter one
+        const canonOfA = mapping[sorted[i]];
+        mapping[sorted[j]] = canonOfA;
+      }
+    }
+  }
+  return mapping;
+}
+
 async function groupAnswers(answers) {
   if (!answers || answers.length === 0) return {};
   const unique = [...new Set(answers.map(a => a.trim().toLowerCase()).filter(Boolean))];
   if (unique.length <= 1) return { [unique[0]]: unique };
+
+  // Step 1: pre-group with deterministic string logic
+  const preMapping = preGroup(unique);
+
   try {
+    // Step 2: send pre-grouped answers to AI for semantic/synonym grouping
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1000,
-        messages: [{ role: 'user', content: `You are grouping free-text answers from a party game. Your job is to find answers that refer to the same thing and group them. Be VERY lenient and generous — if there is any reasonable way to consider two answers the same, group them.
+        messages: [{ role: 'user', content: `You are grouping free-text answers from a party game. Be VERY lenient — when in doubt, group together.
 
-Grouping rules (apply all of these):
-1. SUBSTRINGS: if one answer contains another, they're the same. "slice of pizza" contains "pizza" → same group. "a quick cricket match" contains "cricket" → same group.
-2. SYNONYMS: rat, mouse, mice, rodent → same. arguing, debate, fight → same. drink, beverage, alcohol → same.
-3. SLASH ALIASES: "facebook/meta/fc" means ALL of facebook, meta, fc, fb are equivalent answers.
-4. ABBREVIATIONS & NICKNAMES: fb=facebook=meta, yt=youtube, ig=instagram, nyc=new york.
-5. PARTIAL MATCH: any answer that is mostly about the same core noun groups together. "a pepperoni pizza", "pizza slice", "some pizza", "nyc pizza" → all "pizza".
-6. ADJECTIVE+NOUN: strip adjectives/articles to find the core. "old whiskey", "a whiskey", "whiskey neat" → "whiskey".
-7. ACTIVITY: "playing football", "football", "a game of football" → "football".
-8. BRAND VARIANTS: different spellings, capitalisations, or common misspellings of the same brand → same group.
+Rules:
+- Synonyms: rat/mouse/mice/rodent → same. argue/debate/fight → same.
+- Slash aliases: "facebook/meta/fc" means facebook, meta, fc, fb are ALL the same answer.
+- Abbreviations: fb=facebook=meta, yt=youtube, ig=instagram, nyc=new york.
+- Same concept: "arguing about AI", "AI debate", "artificial intelligence" → same.
+- Brands & variants: different spellings or nicknames of same brand → same group.
 
-Answers to group: ${JSON.stringify(unique)}
+Answers: ${JSON.stringify(unique)}
 
-Respond ONLY with a valid JSON object where every key is one of the given answers (lowercase, exactly as given) and its value is the canonical name for that group (choose the shortest, clearest form). No markdown, no extra text.` }]
+Reply ONLY with a valid JSON object. Every key must be one of the given answers exactly. Value is the canonical (shortest/clearest). No markdown.` }]
       })
     });
     const data = await res.json();
     const text = data.content?.find(c => c.type === 'text')?.text || '{}';
-    const mapping = JSON.parse(text.replace(/```json|```/g, '').trim());
+    const aiMapping = JSON.parse(text.replace(/```json|```/g, '').trim());
+
+    // Step 3: merge — AI mapping takes precedence for semantic groups,
+    // but pre-mapping substring groups always apply
+    const finalMapping = {};
+    unique.forEach(a => {
+      const aiCanon = aiMapping[a] || a;
+      const preCanon = preMapping[a] || a;
+      // If pre-grouping found a substring match, use it (more reliable)
+      // Otherwise use the AI canonical
+      finalMapping[a] = (preCanon !== a) ? preCanon : aiCanon;
+    });
+
+    // Build groups from final mapping
     const groups = {};
     unique.forEach(a => {
-      const canon = mapping[a] || a;
+      const canon = finalMapping[a] || a;
       if (!groups[canon]) groups[canon] = [];
       groups[canon].push(a);
     });
     return groups;
   } catch {
+    // Fallback: just use pre-grouping
     const groups = {};
-    unique.forEach(a => { groups[a] = [a]; });
+    unique.forEach(a => {
+      const canon = preMapping[a] || a;
+      if (!groups[canon]) groups[canon] = [];
+      groups[canon].push(a);
+    });
     return groups;
   }
 }
 
 function getCanonical(raw, groups) {
   const lower = raw.trim().toLowerCase();
+  // Exact member match
   for (const [canon, members] of Object.entries(groups)) {
     if (members.includes(lower)) return canon;
+  }
+  // Fallback: substring match against all canonicals
+  const core = coreOf(lower);
+  for (const canon of Object.keys(groups)) {
+    const coreCanon = coreOf(canon);
+    if (core && coreCanon && (core.includes(coreCanon) || coreCanon.includes(core))) return canon;
   }
   return lower;
 }
