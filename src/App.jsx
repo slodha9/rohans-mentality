@@ -127,7 +127,7 @@ export default function App() {
   const [timerSetup, setTimerSetup] = useState(60);
   const timerRef = useRef(null);
   const prevRound = useRef(null);
-  const revealFired = useRef(false);  // prevents double-trigger of reveal
+  const isRevealingRef = useRef(false); // prevents double-trigger
 
   // Live sync
   useEffect(() => {
@@ -142,10 +142,9 @@ export default function App() {
     if (phase === 'setup') { if (playerRole === 'admin') setScreen('setup'); }
     else if (phase === 'lobby') setScreen('lobby');
     else if (phase === 'answer') {
-      if (currentRound !== prevRound.current) { setMyAnswer(''); setSubmitted(false); setHasDisqualified(false); revealFired.current = false; }
+      if (currentRound !== prevRound.current) { setMyAnswer(''); setSubmitted(false); setHasDisqualified(false); isRevealingRef.current = false; }
       setScreen('answer');
     }
-    else if (phase === 'revealing') setScreen('revealing');
     else if (phase === 'reveal') setScreen('reveal');
     else if (phase === 'end') setScreen('end');
     prevRound.current = currentRound;
@@ -168,7 +167,7 @@ export default function App() {
       if (left <= 0) {
         clearInterval(timerRef.current);
         if (playerRoleRef.current === 'admin') {
-          if (!revealFired.current) { revealFired.current = true; triggerReveal(); }
+          if (!isRevealingRef.current) { isRevealingRef.current = true; triggerReveal(); }
         } else if (!submittedRef.current && playerName) {
           doSubmit(myAnswer || '(no answer)');
         }
@@ -270,11 +269,8 @@ export default function App() {
 
   // REVEAL — guarded so it can only fire once per round
   const triggerReveal = async () => {
-    if (revealFired.current) return;
-    revealFired.current = true;
-    // Set a 'revealing' phase immediately so the button can't be pressed again
-    // and players see a loading state
-    await update(ref(db, 'game'), { phase: 'revealing' });
+    if (isRevealingRef.current) return;
+    isRevealingRef.current = true;
     const snap = await get(ref(db, 'game'));
     const data = snap.val();
     const answers = data.currentAnswers || {};
@@ -365,7 +361,7 @@ export default function App() {
   // SKIP QUESTION — admin only, jumps to next round without reveal
   const handleSkip = async () => {
     if (!confirm('Skip this question? No points awarded for this round.')) return;
-    revealFired.current = true; // prevent timer from triggering reveal
+    isRevealingRef.current = true; // prevent timer from triggering reveal
     clearInterval(timerRef.current);
     const snap = await get(ref(db, 'game'));
     const data = snap.val();
@@ -393,8 +389,6 @@ export default function App() {
   if (!gs) return <Waiting msg="Connecting..." />;
   if (screen === 'lobby') return <LobbyScreen players={players} playerName={playerName} isAdmin={isAdmin} onStart={handleStart} timerSeconds={gs.timerSeconds} />;
 
-  if (screen === 'revealing') return <Waiting msg="Grouping answers..." />;
-
   if (screen === 'answer') return (
     <AnswerScreen
       question={q} round={gs.currentRound} total={QUESTIONS.length}
@@ -402,7 +396,7 @@ export default function App() {
       myAnswer={myAnswer} setMyAnswer={setMyAnswer} submitted={submitted}
       onSubmit={() => doSubmit(myAnswer)} players={players}
       currentAnswers={gs.currentAnswers || {}} isAdmin={isAdmin}
-      onForceReveal={() => { if (!revealFired.current) { revealFired.current = true; triggerReveal(); } }}
+      onForceReveal={() => { if (!isRevealingRef.current) { isRevealingRef.current = true; triggerReveal(); } }}
       onSkip={handleSkip}
       onEnd={endGame} playerRole={playerRole}
     />
