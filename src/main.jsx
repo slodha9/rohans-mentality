@@ -4,6 +4,7 @@ import { ref, onValue, set, update, remove, get } from 'firebase/database';
 import { db } from './firebase';
 import { DEFAULT_QUESTIONS } from './questions';
 import './styles.css';
+import { groupAnswers, getHerdAnswer } from "./utils/groupAnswers";
 
 const GAME_PATH = 'rohansMentality/liveGame';
 const PLAYER_KEY = 'rohans-mentality-player-id';
