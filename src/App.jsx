@@ -608,8 +608,8 @@ function StandingsEditor({ leaderboard, scores, playerId, isAdmin, onAdjustScore
   // Initialise local scores from props, but only if admin hasn't started editing
   const displayed = localScores || scores;
 
-  // Sort by local scores while editing, by real scores otherwise
-  const sorted = [...leaderboard].sort((a, b) => (displayed[b.id] || 0) - (displayed[a.id] || 0));
+  // Always sort by real scores — rows never move while editing, only re-rank after Apply
+  const sorted = [...leaderboard].sort((a, b) => (scores[b.id] || 0) - (scores[a.id] || 0));
 
   const adjust = (pid, delta) => {
     if (!isAdmin) return;
