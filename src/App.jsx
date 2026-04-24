@@ -125,7 +125,8 @@ export default function App() {
   useEffect(() => {
     if (!gameState) return;
     const { phase, currentRound } = gameState;
-    if (phase === 'lobby') setScreen('lobby');
+    if (phase === 'setup') { if (playerRole === 'admin') setScreen('setup'); }
+    else if (phase === 'lobby') setScreen('lobby');
     else if (phase === 'answer') {
       if (currentRound !== prevRound.current) { setMyAnswer(''); setSubmitted(false); setHasDisqualified(false); }
       setScreen('answer');
@@ -155,6 +156,18 @@ export default function App() {
 
   const endGame = () => { if (confirm('End game now?')) update(ref(db, 'game'), { phase: 'end' }); };
 
+  // Force-wipe stale game and create fresh (admin only, emergency use)
+  const forceCreate = async () => {
+    const name = nameInput.trim();
+    if (!name) return setJoinError('Enter your name first!');
+    if (!confirm('This will DELETE the current game and start fresh. Sure?')) return;
+    const p = { id: playerId, name, role: 'admin', joinedAt: Date.now() };
+    await set(ref(db, 'game'), { phase: 'setup', players: { [playerId]: p }, scores: {}, timerSeconds: 60, questions: QUESTIONS, currentRound: 0 });
+    setPlayerName(name);
+    setPlayerRole('admin');
+    setScreen('setup');
+  };
+
   // JOIN
   const handleJoin = async () => {
     const name = nameInput.trim();
@@ -163,12 +176,19 @@ export default function App() {
     const data = snap.val();
     if (!data && roleInput !== 'admin') return setJoinError('No game yet. Join as Admin to create one.');
     if (roleInput === 'rohan' && Object.values(data?.players || {}).some(p => p.role === 'rohan')) return setJoinError('Rohan has already joined!');
-    if (roleInput === 'admin' && data && data.phase !== 'lobby') return setJoinError('Game already started!');
+    if (roleInput === 'admin' && data && data.phase !== 'lobby' && data.phase !== 'setup') {
+      return setJoinError('A game is already running. Ask the current admin to reset it, or use "Force Create" below.');
+    }
 
     const p = { id: playerId, name, role: roleInput, joinedAt: Date.now() };
     if (roleInput === 'admin' && !data) {
+      // Fresh game
       await set(ref(db, 'game'), { phase: 'setup', players: { [playerId]: p }, scores: {}, timerSeconds: 60, questions: QUESTIONS, currentRound: 0 });
       setScreen('setup');
+    } else if (roleInput === 'admin' && data && (data.phase === 'lobby' || data.phase === 'setup')) {
+      // Admin rejoining an existing lobby/setup — just add themselves back
+      await update(ref(db, `game/players/${playerId}`), p);
+      setScreen(data.phase === 'setup' ? 'setup' : 'lobby');
     } else {
       await update(ref(db, `game/players/${playerId}`), p);
       if (roleInput !== 'admin') await update(ref(db, `game/scores`), { [playerId]: 0 });
@@ -268,7 +288,7 @@ export default function App() {
 
   // ── RENDER ─────────────────────────────────────────────────────────────────
 
-  if (!playerName || screen === 'join') return <JoinScreen {...{ nameInput, setNameInput, roleInput, setRoleInput, joinError, handleJoin, gameExists: !!gs }} />;
+  if (!playerName || screen === 'join') return <JoinScreen {...{ nameInput, setNameInput, roleInput, setRoleInput, joinError, handleJoin, gameExists: !!gs, forceCreate }} />;
   if (screen === 'setup') return <SetupScreen timerSetup={timerSetup} setTimerSetup={setTimerSetup} onDone={handleSetupDone} />;
   if (!gs) return <Waiting msg="Connecting..." />;
   if (screen === 'lobby') return <LobbyScreen players={players} playerName={playerName} isAdmin={isAdmin} onStart={handleStart} timerSeconds={gs.timerSeconds} />;
@@ -306,7 +326,7 @@ export default function App() {
 }
 
 // ─── JOIN SCREEN ──────────────────────────────────────────────────────────────
-function JoinScreen({ nameInput, setNameInput, roleInput, setRoleInput, joinError, handleJoin, gameExists }) {
+function JoinScreen({ nameInput, setNameInput, roleInput, setRoleInput, joinError, handleJoin, gameExists, forceCreate }) {
   const roleDescs = { player: 'Think like the herd, or think like Rohan.', admin: 'You control the game. Create & manage rounds.', rohan: 'You ARE Rohan. Your answer sets the benchmark.' };
   return (
     <div style={{ ...S.page, justifyContent: 'center' }}>
@@ -330,6 +350,11 @@ function JoinScreen({ nameInput, setNameInput, roleInput, setRoleInput, joinErro
           <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.65rem', color: '#5a5a72', marginTop: 6 }}>{roleDescs[roleInput]}</div>
         </div>
         {joinError && <div style={{ color: '#ef4444', fontFamily: '"DM Mono",monospace', fontSize: '0.72rem', padding: '8px 10px', background: 'rgba(239,68,68,0.08)', borderRadius: 8, border: '1px solid rgba(239,68,68,0.2)' }}>⚠ {joinError}</div>}
+        {joinError && roleInput === 'admin' && (
+          <button style={{ ...S.btnGhost, color: '#ef4444', borderColor: 'rgba(239,68,68,0.3)', width: '100%', padding: '10px' }} onClick={forceCreate}>
+            ⚠ FORCE CREATE NEW GAME (wipes existing)
+          </button>
+        )}
         <button style={S.btnPrimary} onClick={handleJoin}>{roleInput === 'admin' && !gameExists ? 'CREATE GAME' : 'JOIN GAME'}</button>
       </div>
       <div style={{ ...S.label, textAlign: 'center', zIndex: 1 }}>Need: 1 Admin · 1 Rohan · 1+ Players</div>
