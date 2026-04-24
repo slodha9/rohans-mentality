@@ -127,6 +127,7 @@ export default function App() {
   const [timerSetup, setTimerSetup] = useState(60);
   const timerRef = useRef(null);
   const prevRound = useRef(null);
+  const revealFired = useRef(false);  // prevents double-trigger of reveal
 
   // Live sync
   useEffect(() => {
@@ -141,25 +142,36 @@ export default function App() {
     if (phase === 'setup') { if (playerRole === 'admin') setScreen('setup'); }
     else if (phase === 'lobby') setScreen('lobby');
     else if (phase === 'answer') {
-      if (currentRound !== prevRound.current) { setMyAnswer(''); setSubmitted(false); setHasDisqualified(false); }
+      if (currentRound !== prevRound.current) { setMyAnswer(''); setSubmitted(false); setHasDisqualified(false); revealFired.current = false; }
       setScreen('answer');
     }
+    else if (phase === 'revealing') setScreen('revealing');
     else if (phase === 'reveal') setScreen('reveal');
     else if (phase === 'end') setScreen('end');
     prevRound.current = currentRound;
   }, [gameState?.phase, gameState?.currentRound]);
 
+  // Keep a ref to playerRole so timer callback always sees current value
+  const playerRoleRef = useRef(playerRole);
+  useEffect(() => { playerRoleRef.current = playerRole; }, [playerRole]);
+  const submittedRef = useRef(submitted);
+  useEffect(() => { submittedRef.current = submitted; }, [submitted]);
+
   // Timer — admin doesn't submit answers, only triggers reveal
   useEffect(() => {
     clearInterval(timerRef.current);
     if (!gameState || gameState.phase !== 'answer' || !gameState.timerEnd) return;
+    const endTime = gameState.timerEnd;
     const tick = () => {
-      const left = Math.max(0, Math.ceil((gameState.timerEnd - Date.now()) / 1000));
+      const left = Math.max(0, Math.ceil((endTime - Date.now()) / 1000));
       setTimerLeft(left);
       if (left <= 0) {
         clearInterval(timerRef.current);
-        if (playerRole === 'admin') { triggerReveal(); }
-        else if (!submitted && playerName) { doSubmit(myAnswer || '(no answer)'); }
+        if (playerRoleRef.current === 'admin') {
+          if (!revealFired.current) { revealFired.current = true; triggerReveal(); }
+        } else if (!submittedRef.current && playerName) {
+          doSubmit(myAnswer || '(no answer)');
+        }
       }
     };
     tick();
@@ -256,8 +268,13 @@ export default function App() {
     await update(ref(db, `game/currentAnswers/${playerId}`), { playerId, playerName, role: playerRole, answer });
   };
 
-  // REVEAL
+  // REVEAL — guarded so it can only fire once per round
   const triggerReveal = async () => {
+    if (revealFired.current) return;
+    revealFired.current = true;
+    // Set a 'revealing' phase immediately so the button can't be pressed again
+    // and players see a loading state
+    await update(ref(db, 'game'), { phase: 'revealing' });
     const snap = await get(ref(db, 'game'));
     const data = snap.val();
     const answers = data.currentAnswers || {};
@@ -345,6 +362,18 @@ export default function App() {
     else await startRound(next, data.timerSeconds);
   };
 
+  // SKIP QUESTION — admin only, jumps to next round without reveal
+  const handleSkip = async () => {
+    if (!confirm('Skip this question? No points awarded for this round.')) return;
+    revealFired.current = true; // prevent timer from triggering reveal
+    clearInterval(timerRef.current);
+    const snap = await get(ref(db, 'game'));
+    const data = snap.val();
+    const next = (data.currentRound || 0) + 1;
+    if (next >= QUESTIONS.length) await update(ref(db, 'game'), { phase: 'end' });
+    else await startRound(next, data.timerSeconds);
+  };
+
   // RESET
   const handleReset = async () => {
     if (confirm('Reset everything?')) { await remove(ref(db, 'game')); setScreen('join'); setPlayerName(''); setMyAnswer(''); setSubmitted(false); }
@@ -364,6 +393,8 @@ export default function App() {
   if (!gs) return <Waiting msg="Connecting..." />;
   if (screen === 'lobby') return <LobbyScreen players={players} playerName={playerName} isAdmin={isAdmin} onStart={handleStart} timerSeconds={gs.timerSeconds} />;
 
+  if (screen === 'revealing') return <Waiting msg="Grouping answers..." />;
+
   if (screen === 'answer') return (
     <AnswerScreen
       question={q} round={gs.currentRound} total={QUESTIONS.length}
@@ -371,7 +402,9 @@ export default function App() {
       myAnswer={myAnswer} setMyAnswer={setMyAnswer} submitted={submitted}
       onSubmit={() => doSubmit(myAnswer)} players={players}
       currentAnswers={gs.currentAnswers || {}} isAdmin={isAdmin}
-      onForceReveal={triggerReveal} onEnd={endGame} playerRole={playerRole}
+      onForceReveal={() => { if (!revealFired.current) { revealFired.current = true; triggerReveal(); } }}
+      onSkip={handleSkip}
+      onEnd={endGame} playerRole={playerRole}
     />
   );
 
@@ -509,7 +542,7 @@ function LobbyScreen({ players, playerName, isAdmin, onStart, timerSeconds }) {
 }
 
 // ─── ANSWER SCREEN ────────────────────────────────────────────────────────────
-function AnswerScreen({ question, round, total, timerLeft, timerTotal, myAnswer, setMyAnswer, submitted, onSubmit, players, currentAnswers, isAdmin, onForceReveal, onEnd, playerRole }) {
+function AnswerScreen({ question, round, total, timerLeft, timerTotal, myAnswer, setMyAnswer, submitted, onSubmit, players, currentAnswers, isAdmin, onForceReveal, onSkip, onEnd, playerRole }) {
   const pct = timerTotal > 0 ? Math.max(0, (timerLeft || 0) / timerTotal) : 0;
   const circ = 2 * Math.PI * 42;
   const timerColor = (timerLeft || 0) > 20 ? '#22c55e' : (timerLeft || 0) > 10 ? '#ffaa00' : '#ef4444';
@@ -561,7 +594,12 @@ function AnswerScreen({ question, round, total, timerLeft, timerTotal, myAnswer,
           })}
         </div>
       </div>
-      {isAdmin && <button style={S.btnGhost} onClick={onForceReveal}>FORCE REVEAL →</button>}
+      {isAdmin && (
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button style={{ ...S.btnGhost, color: '#22d3ee', borderColor: 'rgba(34,211,238,0.35)' }} onClick={onForceReveal}>FORCE REVEAL →</button>
+          <button style={{ ...S.btnGhost, color: '#ffaa00', borderColor: 'rgba(255,170,0,0.35)' }} onClick={onSkip}>SKIP QUESTION ⏭</button>
+        </div>
+      )}
     </div>
   );
 }
