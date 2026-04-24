@@ -38,20 +38,21 @@ async function groupAnswers(answers) {
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1000,
-        messages: [{ role: 'user', content: `You are grouping answers for a party game about a person named Rohan. Group answers by semantic similarity. Be VERY lenient — when in doubt, group together.
+        messages: [{ role: 'user', content: `You are grouping free-text answers from a party game. Your job is to find answers that refer to the same thing and group them. Be VERY lenient and generous — if there is any reasonable way to consider two answers the same, group them.
 
-Rules:
-- Synonyms group together: "rat", "mouse", "mice", "rodent" → same group
-- Slash-separated aliases are ALL equivalent: if someone wrote "facebook/meta/fc", then "facebook", "meta", "fc", "fb", and any combo count as the same answer
-- Abbreviations, nicknames, alternate names all match: "fb" = "facebook" = "meta"  
-- Partial matches: "nyc pizza", "pepperoni pizza", "a pizza" → "pizza"
-- Activity + noun: "playing cricket", "cricket" → "cricket"
-- Same concept different words: "arguing", "debate", "fighting" → group together
-- Brand names and their common aliases: "apple", "iphone company", "cupertino" → "apple"
+Grouping rules (apply all of these):
+1. SUBSTRINGS: if one answer contains another, they're the same. "slice of pizza" contains "pizza" → same group. "a quick cricket match" contains "cricket" → same group.
+2. SYNONYMS: rat, mouse, mice, rodent → same. arguing, debate, fight → same. drink, beverage, alcohol → same.
+3. SLASH ALIASES: "facebook/meta/fc" means ALL of facebook, meta, fc, fb are equivalent answers.
+4. ABBREVIATIONS & NICKNAMES: fb=facebook=meta, yt=youtube, ig=instagram, nyc=new york.
+5. PARTIAL MATCH: any answer that is mostly about the same core noun groups together. "a pepperoni pizza", "pizza slice", "some pizza", "nyc pizza" → all "pizza".
+6. ADJECTIVE+NOUN: strip adjectives/articles to find the core. "old whiskey", "a whiskey", "whiskey neat" → "whiskey".
+7. ACTIVITY: "playing football", "football", "a game of football" → "football".
+8. BRAND VARIANTS: different spellings, capitalisations, or common misspellings of the same brand → same group.
 
 Answers to group: ${JSON.stringify(unique)}
 
-Respond ONLY with a valid JSON object mapping each answer (lowercase, exactly as given) to its canonical group name. Pick the most recognisable/shortest form as the canonical. No markdown, no explanation.` }]
+Respond ONLY with a valid JSON object where every key is one of the given answers (lowercase, exactly as given) and its value is the canonical name for that group (choose the shortest, clearest form). No markdown, no extra text.` }]
       })
     });
     const data = await res.json();
@@ -185,7 +186,20 @@ export default function App() {
     const name = nameInput.trim();
     if (!name) return setJoinError('Enter your name!');
     const snap = await get(ref(db, 'game'));
-    const data = snap.val();
+    let data = snap.val();
+
+    // Auto-clear stale games for admin:
+    // 1. Game is in 'end' phase (someone forgot to reset)
+    // 2. Game is older than 12 hours (abandoned session)
+    if (roleInput === 'admin' && data) {
+      const isEnded = data.phase === 'end';
+      const isStale = data.createdAt && (Date.now() - data.createdAt > 12 * 60 * 60 * 1000);
+      if (isEnded || isStale) {
+        await remove(ref(db, 'game'));
+        data = null;
+      }
+    }
+
     if (!data && roleInput !== 'admin') return setJoinError('No game yet. Join as Admin to create one.');
     if (roleInput === 'rohan' && Object.values(data?.players || {}).some(p => p.role === 'rohan')) return setJoinError('Rohan has already joined!');
     if (roleInput === 'admin' && data && data.phase !== 'lobby' && data.phase !== 'setup') {
@@ -195,10 +209,10 @@ export default function App() {
     const p = { id: playerId, name, role: roleInput, joinedAt: Date.now() };
     if (roleInput === 'admin' && !data) {
       // Fresh game
-      await set(ref(db, 'game'), { phase: 'setup', players: { [playerId]: p }, scores: {}, timerSeconds: 60, questions: QUESTIONS, currentRound: 0 });
+      await set(ref(db, 'game'), { phase: 'setup', players: { [playerId]: p }, scores: {}, timerSeconds: 60, questions: QUESTIONS, currentRound: 0, createdAt: Date.now() });
       setScreen('setup');
     } else if (roleInput === 'admin' && data && (data.phase === 'lobby' || data.phase === 'setup')) {
-      // Admin rejoining an existing lobby/setup — just add themselves back
+      // Admin rejoining an existing lobby/setup
       await update(ref(db, `game/players/${playerId}`), p);
       setScreen(data.phase === 'setup' ? 'setup' : 'lobby');
     } else {
@@ -552,6 +566,72 @@ function AnswerScreen({ question, round, total, timerLeft, timerTotal, myAnswer,
   );
 }
 
+// ─── STANDINGS EDITOR ────────────────────────────────────────────────────────
+// Admin edits scores locally, then hits "Apply" — ranks only update on submit
+function StandingsEditor({ leaderboard, scores, playerId, isAdmin, onAdjustScore }) {
+  const [localScores, setLocalScores] = useState(null);
+  const [dirty, setDirty] = useState(false);
+
+  // Initialise local scores from props, but only if admin hasn't started editing
+  const displayed = localScores || scores;
+
+  // Sort by local scores while editing, by real scores otherwise
+  const sorted = [...leaderboard].sort((a, b) => (displayed[b.id] || 0) - (displayed[a.id] || 0));
+
+  const adjust = (pid, delta) => {
+    if (!isAdmin) return;
+    const base = localScores || { ...scores };
+    setLocalScores({ ...base, [pid]: (base[pid] || 0) + delta });
+    setDirty(true);
+  };
+
+  const handleApply = async () => {
+    if (!localScores) return;
+    // Diff against real scores and apply each change
+    const pids = Object.keys(localScores);
+    for (const pid of pids) {
+      const delta = (localScores[pid] || 0) - (scores[pid] || 0);
+      if (delta !== 0) await onAdjustScore(pid, delta);
+    }
+    setLocalScores(null);
+    setDirty(false);
+  };
+
+  const handleCancel = () => { setLocalScores(null); setDirty(false); };
+
+  return (
+    <div style={{ ...S.card, maxWidth: 640 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <div style={S.label}>Standings</div>
+        {isAdmin && dirty && (
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button onClick={handleCancel} style={{ ...S.btnGhost, padding: '4px 10px', fontSize: '0.65rem' }}>Cancel</button>
+            <button onClick={handleApply} style={{ ...S.btnGhost, padding: '4px 10px', fontSize: '0.65rem', color: '#22c55e', borderColor: 'rgba(34,197,94,0.35)' }}>✓ Apply</button>
+          </div>
+        )}
+        {isAdmin && !dirty && <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.6rem', color: '#5a5a72' }}>⚡ use ± to edit, then apply</div>}
+      </div>
+      {sorted.map((p, i) => (
+        <div key={p.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 10px', background: i === 0 ? 'rgba(255,215,0,0.05)' : 'transparent', border: `1px solid ${i === 0 ? 'rgba(255,215,0,0.15)' : 'transparent'}`, borderRadius: 8, marginBottom: 4 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ fontFamily: '"Bebas Neue",sans-serif', fontSize: '1rem', color: i === 0 ? '#ffd700' : i === 1 ? '#9090a8' : '#5a5a72', width: 20, textAlign: 'center' }}>{i + 1}</div>
+            <div style={{ fontWeight: 600, fontSize: '0.9rem', color: p.id === playerId ? '#ff3c3c' : '#f0f0f5' }}>{p.name}</div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {isAdmin && (
+              <button onClick={() => adjust(p.id, -1)} style={{ width: 26, height: 26, borderRadius: 6, border: '1px solid #2e2e38', background: 'transparent', color: '#9090a8', cursor: 'pointer', fontFamily: '"Bebas Neue",sans-serif', fontSize: '1.1rem', lineHeight: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>−</button>
+            )}
+            <div style={{ fontFamily: '"Bebas Neue",sans-serif', fontSize: '1.3rem', color: dirty ? (localScores?.[p.id] !== scores[p.id] ? '#ffaa00' : '#f0f0f5') : (i === 0 ? '#ffd700' : '#f0f0f5'), minWidth: 28, textAlign: 'center' }}>{displayed[p.id] || 0}</div>
+            {isAdmin && (
+              <button onClick={() => adjust(p.id, +1)} style={{ width: 26, height: 26, borderRadius: 6, border: '1px solid #2e2e38', background: 'transparent', color: '#9090a8', cursor: 'pointer', fontFamily: '"Bebas Neue",sans-serif', fontSize: '1.1rem', lineHeight: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>+</button>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ─── REVEAL SCREEN ────────────────────────────────────────────────────────────
 function RevealScreen({ question, round, total, players, answers, herdAnswer, rohanAnswer, rohanCanon, groupedAnswers, points, scores, disqualified, playerId, isAdmin, isRohan, hasDisqualified, onDisqualify, onRecomputePoints, onAdjustScore, onNext, isLast, onEnd }) {
   const nonRohan = Object.values(answers).filter(a => a.role !== 'rohan' && a.role !== 'admin').sort((a, b) => (points[b.playerId]?.pts || 0) - (points[a.playerId]?.pts || 0));
@@ -651,30 +731,14 @@ function RevealScreen({ question, round, total, players, answers, herdAnswer, ro
         </div>
       </div>
 
-      {/* Standings — admin gets ± controls */}
-      <div style={{ ...S.card, maxWidth: 640 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-          <div style={S.label}>Standings</div>
-          {isAdmin && <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.6rem', color: '#5a5a72' }}>⚡ admin: adjust totals</div>}
-        </div>
-        {leaderboard.map((p, i) => (
-          <div key={p.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 10px', background: i === 0 ? 'rgba(255,215,0,0.05)' : 'transparent', border: `1px solid ${i === 0 ? 'rgba(255,215,0,0.15)' : 'transparent'}`, borderRadius: 8, marginBottom: 4 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <div style={{ fontFamily: '"Bebas Neue",sans-serif', fontSize: '1rem', color: i === 0 ? '#ffd700' : i === 1 ? '#9090a8' : '#5a5a72', width: 20, textAlign: 'center' }}>{i + 1}</div>
-              <div style={{ fontWeight: 600, fontSize: '0.9rem', color: p.id === playerId ? '#ff3c3c' : '#f0f0f5' }}>{p.name}</div>
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              {isAdmin && (
-                <button onClick={() => onAdjustScore(p.id, -1)} style={{ width: 26, height: 26, borderRadius: 6, border: '1px solid #2e2e38', background: 'transparent', color: '#9090a8', cursor: 'pointer', fontFamily: '"Bebas Neue",sans-serif', fontSize: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>−</button>
-              )}
-              <div style={{ fontFamily: '"Bebas Neue",sans-serif', fontSize: '1.3rem', color: i === 0 ? '#ffd700' : '#f0f0f5', minWidth: 28, textAlign: 'center' }}>{scores[p.id] || 0}</div>
-              {isAdmin && (
-                <button onClick={() => onAdjustScore(p.id, +1)} style={{ width: 26, height: 26, borderRadius: 6, border: '1px solid #2e2e38', background: 'transparent', color: '#9090a8', cursor: 'pointer', fontFamily: '"Bebas Neue",sans-serif', fontSize: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>+</button>
-              )}
-            </div>
-          </div>
-        ))}
-      </div>
+      {/* Standings — admin gets editable score table with a submit button */}
+      <StandingsEditor
+        leaderboard={leaderboard}
+        scores={scores}
+        playerId={playerId}
+        isAdmin={isAdmin}
+        onAdjustScore={onAdjustScore}
+      />
 
       {isRohan && <div style={{ fontFamily: '"DM Mono",monospace', fontSize: '0.72rem', color: disqualified ? '#a855f7' : '#5a5a72', padding: '8px 14px', background: 'rgba(168,85,247,0.07)', border: '1px solid rgba(168,85,247,0.2)', borderRadius: 8 }}>{disqualified || hasDisqualified ? '👑 Disqualification applied.' : '👆 Tap DISQ −1 to penalise one player this round.'}</div>}
       {isAdmin
