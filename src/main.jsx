@@ -4,7 +4,7 @@ import { ref, onValue, set, update, remove, get } from 'firebase/database';
 import { db } from './firebase';
 import { DEFAULT_QUESTIONS } from './questions';
 import './styles.css';
-import { groupAnswers, getHerdAnswer } from "./utils/groupAnswers";
+import { groupAnswers, areSimilarAnswers } from "./utils/groupAnswers";
 
 const GAME_PATH = 'rohansMentality/liveGame';
 const PLAYER_KEY = 'rohans-mentality-player-id';
@@ -12,115 +12,6 @@ const ROLE_KEY = 'rohans-mentality-role';
 
 const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 const clean = (value = '') => value.trim().slice(0, 100);
-
-const STOP_WORDS = new Set(['the', 'a', 'an', 'and', 'or', 'to', 'of', 'his', 'her', 'with', 'at', 'in', 'on', 'for']);
-const ANSWER_ALIASES = {
-  nyc: 'new york',
-  'new york city': 'new york',
-  sf: 'san francisco',
-  'san fran': 'san francisco',
-  'sanfrancisco': 'san francisco',
-  philly: 'philadelphia',
-  fb: 'meta',
-  facebook: 'meta',
-  insta: 'instagram',
-  ig: 'instagram',
-  apple: 'apple',
-  iphone: 'iphone',
-  iphones: 'iphone',
-  stocks: 'stock',
-  shares: 'stock',
-  equities: 'stock',
-  equity: 'stock',
-  investing: 'investment',
-  investments: 'investment',
-  investor: 'investment',
-  debate: 'argument',
-  arguing: 'argument',
-  arguments: 'argument',
-  crochet: 'crochet',
-  crocheting: 'crochet'
-};
-
-function singularize(word) {
-  if (word.length <= 3) return word;
-  if (word.endsWith('ies')) return `${word.slice(0, -3)}y`;
-  if (word.endsWith('es') && !word.endsWith('ses')) return word.slice(0, -2);
-  if (word.endsWith('s') && !word.endsWith('ss')) return word.slice(0, -1);
-  return word;
-}
-
-function normalize(value = '') {
-  const base = value
-    .toLowerCase()
-    .trim()
-    .replace(/&/g, ' and ')
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (ANSWER_ALIASES[base]) return ANSWER_ALIASES[base];
-  const words = base
-    .split(' ')
-    .filter(Boolean)
-    .filter(word => !STOP_WORDS.has(word))
-    .map(word => ANSWER_ALIASES[word] || singularize(word));
-  const phrase = words.join(' ').trim();
-  return ANSWER_ALIASES[phrase] || phrase;
-}
-
-function editDistance(a, b) {
-  if (a === b) return 0;
-  if (!a || !b) return Math.max(a.length, b.length);
-  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i]);
-  for (let j = 1; j <= b.length; j++) dp[0][j] = j;
-  for (let i = 1; i <= a.length; i++) {
-    for (let j = 1; j <= b.length; j++) {
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
-      );
-    }
-  }
-  return dp[a.length][b.length];
-}
-
-function areSimilarAnswers(a, b) {
-  const x = normalize(a);
-  const y = normalize(b);
-  if (!x || !y) return false;
-  if (x === y) return true;
-  if (editDistance(x, y) <= 1) return true;
-  const xWords = new Set(x.split(' '));
-  const yWords = new Set(y.split(' '));
-  const overlap = [...xWords].filter(w => yWords.has(w)).length;
-  const smaller = Math.min(xWords.size, yWords.size);
-  return smaller > 0 && overlap / smaller >= 0.75;
-}
-
-function groupAnswers(players, answers, excludeRoles = []) {
-  const groups = [];
-  Object.entries(answers || {}).forEach(([playerId, answer]) => {
-    const player = players?.[playerId];
-    if (!player || excludeRoles.includes(player.role)) return;
-    const display = clean(answer.answer || '(no answer)') || '(no answer)';
-    const normalized = normalize(display) || '__blank__';
-    let group = groups.find(g => areSimilarAnswers(g.display, display) || g.key === normalized);
-    if (!group) {
-      group = { key: normalized, display, count: 0, playerIds: [], variants: [] };
-      groups.push(group);
-    }
-    group.count += 1;
-    group.playerIds.push(playerId);
-    group.variants.push(display);
-    if (display !== '(no answer)' && (group.display === '(no answer)' || display.length < group.display.length)) group.display = display;
-  });
-  return groups.sort((a, b) => b.count - a.count || a.display.localeCompare(b.display));
-}
-
-function findMatchingGroup(groups, answer) {
-  return groups.find(g => g.playerIds?.length && areSimilarAnswers(g.display, answer));
-}
 
 function getRound(game) {
   return game?.rounds?.[game.currentRound] || {};
