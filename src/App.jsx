@@ -186,6 +186,14 @@ export default function App() {
   const [timerSetup, setTimerSetup] = useState(60);
   const timerRef = useRef(null);
   const prevRound = useRef(null);
+  const submittedRef = useRef(false);
+  const myAnswerRef = useRef('');
+  const playerRoleRef = useRef('player');
+
+  // Keep refs in sync with state so timer callbacks always read fresh values
+  useEffect(() => { submittedRef.current = submitted; }, [submitted]);
+  useEffect(() => { myAnswerRef.current = myAnswer; }, [myAnswer]);
+  useEffect(() => { playerRoleRef.current = playerRole; }, [playerRole]);
 
   // Live sync
   useEffect(() => {
@@ -193,22 +201,29 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // Phase changes
+  // Phase changes — only fires when phase or round number actually changes
   useEffect(() => {
     if (!gameState) return;
     const { phase, currentRound } = gameState;
-    if (phase === 'setup') { if (playerRole === 'admin') setScreen('setup'); }
+    if (phase === 'setup') { if (playerRoleRef.current === 'admin') setScreen('setup'); }
     else if (phase === 'lobby') setScreen('lobby');
     else if (phase === 'answer') {
-      if (currentRound !== prevRound.current) { setMyAnswer(''); setSubmitted(false); setHasDisqualified(false); }
+      // Only reset answer state when the round number changes, not on every update
+      if (currentRound !== prevRound.current) {
+        setMyAnswer('');
+        setSubmitted(false);
+        submittedRef.current = false;
+        myAnswerRef.current = '';
+        setHasDisqualified(false);
+      }
       setScreen('answer');
+      prevRound.current = currentRound;
     }
     else if (phase === 'reveal') setScreen('reveal');
     else if (phase === 'end') setScreen('end');
-    prevRound.current = currentRound;
   }, [gameState?.phase, gameState?.currentRound]);
 
-  // Timer — just counts down. Admin side writes endRound flag when time is up.
+  // Timer — just counts down. Uses refs to avoid stale closure bugs.
   useEffect(() => {
     clearInterval(timerRef.current);
     if (!gameState || gameState.phase !== 'answer' || !gameState.timerEnd) return;
@@ -218,12 +233,11 @@ export default function App() {
       setTimerLeft(left);
       if (left <= 0) {
         clearInterval(timerRef.current);
-        // Non-admin players auto-submit their answer
-        if (playerRole !== 'admin' && !submitted && playerName) {
-          doSubmit(myAnswer || '(no answer)');
+        // Use refs — not state — so we always read the current value
+        if (playerRoleRef.current !== 'admin' && !submittedRef.current && playerName) {
+          doSubmit(myAnswerRef.current || '(no answer)');
         }
-        // Admin signals round end via Firebase flag
-        if (playerRole === 'admin') {
+        if (playerRoleRef.current === 'admin') {
           update(ref(db, 'game'), { endRound: Date.now() });
         }
       }
@@ -322,10 +336,11 @@ export default function App() {
 
   // SUBMIT ANSWER — admin never calls this
   const doSubmit = async (text) => {
-    if (submitted || playerRole === 'admin') return;
-    const answer = (text || '').trim().slice(0, 100) || '(no answer)';
+    if (submittedRef.current || playerRoleRef.current === 'admin') return;
+    submittedRef.current = true;  // set ref immediately to block any concurrent calls
     setSubmitted(true);
-    await update(ref(db, `game/currentAnswers/${playerId}`), { playerId, playerName, role: playerRole, answer });
+    const answer = (text || '').trim().slice(0, 100) || '(no answer)';
+    await update(ref(db, `game/currentAnswers/${playerId}`), { playerId, playerName, role: playerRoleRef.current, answer });
   };
 
   // Run the reveal — called only by admin when endRound flag is set
